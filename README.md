@@ -23,7 +23,8 @@ when no page is there to show it.
 - **Reminders reach you with no page open.** A minimised Chrome window, one
   behind another app, or one showing only `chrome://` tabs gets an OS
   notification with *I drank water!* and *Snooze 10 min* instead of a bubble nobody
-  would see. The toolbar icon also carries a dot while a reminder is waiting.
+  would see, and no bubble is left waiting behind it. The toolbar icon also
+  carries a dot while a reminder is unanswered, by either route.
 - **Toolbar popup** with today's count and progress bar, a seven-day strip with
   a streak, undo, the daily goal stepper, and a settings view behind the gear.
 - **Twelve bear variants** (bow, crown, bucket hat, headphones, hearts, scarf and
@@ -83,8 +84,10 @@ mirrored into `chrome.storage.sync`, which is Chrome's own sync supplied by the
 browser — the data goes to the signed-in Chrome profile, not to a third party.
 
 Permissions requested are `alarms` (the reminder timer), `storage` (state and
-sync), `tabs` (finding a page that can show a reminder) and `notifications` (the
-OS fallback when no page can).
+sync), `tabs` (finding a page that can show a reminder), `notifications` (the OS
+fallback when no page can) and `scripting` (loading the bear into tabs that were
+already open when the extension was installed), with host access to the same
+`http`/`https`/`file` pages the content scripts already run on.
 
 ## Licence
 

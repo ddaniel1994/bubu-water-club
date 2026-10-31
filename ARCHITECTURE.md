@@ -56,9 +56,12 @@ both into its shadow root. Only the widget's chrome (`.wrap`, `.bubble`, `.count
 - `tabs` — reads `tab.url` to decide which tabs receive a reminder, and `windows.getLastFocused` to decide
   whether any of them is actually on screen.
 - `notifications` — the OS fallback when no page can show a reminder. It is a *warning* permission, so an
-  already-installed build has to accept the update before the fallback works.
-- `web_accessible_resources` — `bear.css` + `bear.svg`, because a content script's own `fetch` runs under
-  the **page's** origin; `content.js` falls back to the `DUDU_ASSETS` worker call when that returns empty.
+  already-installed build has to accept the update before the fallback works.- `scripting` (with host permissions for `http://*/*`, `https://*/*`, `file:///*`) — `executeScript` needs host
+  access of its own; declarative `content_scripts` matches do not grant it. It is used once per install/update,
+  by `injectOpenTabs()`, to load the three files into tabs that were already open. The host patterns are the
+  same ones the content scripts declare, so the install prompt is the one the extension already showed.
+- `web_accessible_resources` — `bear.css` + `bear.svg`, because a content script's own `fetch` runs under the
+  **page's** origin; `content.js` falls back to the `DUDU_ASSETS` worker call when that returns empty.
 - Content scripts match `http://*/*`, `https://*/*`, `file:///*` in two entries — `preload.js` at
   `document_start`; `lines.js` then `content.js` at `document_idle`. `file://` needs **Allow access to file URLs**;
   `chrome://` pages can never be matched and there is no new-tab override.
@@ -83,7 +86,7 @@ One flat `chrome.storage.local` record, shared by every context.
   stopAtGoal: false, // stop reminding once the goal is reached
   history: [],    // finished days: [{day, glasses, goal}], oldest first, capped at 30
   pos: {right: 22, bottom: 24},          // bear position in px, shared by every tab
-  bubble: {open: false, at: 0, line: 0}, // reminder bubble + write stamp + caption index
+  bubble: {open: false, at: 0, line: 0, noted: false}, // page bubble / OS round + write stamp + caption index
   syncAt: 0,      // epoch ms of the last action that changed the count; orders today across devices
   syncMeta: {},   // {key: epoch ms of the last edit} per account-wide setting; the newer edit wins
   snoozeUntil: 0, // epoch ms a snooze fires at; the bear's clock badge shows while this is in the future
@@ -146,15 +149,27 @@ background.js <──────> chrome.storage.sync   (mirror of SYNCED + his
 background.js ──{type:'DUDU_REMIND', at}──> content.js   (fire-and-forget broadcast, one `at` per round)
 content.js ────{type:'DUDU_SNOOZE'}──> background.js (arms the one-shot `snooze` alarm)
 content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.css + bear.svg when the page-origin fetch is empty)
+background.js ──{type:'DUDU_PROBE'}──> content.js  (answered synchronously: is this page actually in front?)
 ```
 
 - **Storage is the source of truth.** The popup renders from its in-memory `state` after
   `Object.assign`, and every context re-reads on `storage.onChanged`.
-- **A page if one can show it, the OS otherwise.** The worker messages every matching tab and swallows
-  the rejections, then asks `visiblePage()` whether anyone can see a bubble: the last-focused window must
-  be focused and not minimised, and its active tab must match `^(https?|file):`. If not, it raises a
-  `chrome.notifications` notification. "A tab exists" is not the test — a bubble written into a background
-  tab is invisible, so the test is "a tab a person is looking at".
+- **A page if one can show it, the OS otherwise — never both.** `visiblePage()` is asked *first*: the
+  last-focused window must be focused and not minimised, and its active tab must match `^(https?|file):`.
+  Those are proxies, so the tab is then asked itself (`DUDU_PROBE`, answered with
+  `visibilityState === 'visible' && document.hasFocus()`): a Chrome window sitting behind another application
+  still reports a focused window and an active page, but nobody is looking at it, and `hasFocus()` is what
+  says so. A tab that cannot answer has no content script to draw a bubble in, so it counts as unseen too.
+  Only then does the worker message the tabs. If no page qualifies, it raises a `chrome.notifications`
+  notification and broadcasts nothing — a broadcast writes `bubble.open`, and a bubble waiting behind a toast
+  the user answers with its own buttons would ask the same question a second time. "A tab exists" is not the
+  test — a bubble written into a background tab is invisible, so the test is "a tab a person is looking at".
+- **The OS round is recorded too, as `bubble {open:false, at, line, noted:true}`.** `open:false` retires a
+  bubble an earlier round left unanswered (it would otherwise be waiting on the next page the user opens),
+  `line` keeps the caption picker advancing so two notifications in a row cannot repeat a sentence, and
+  `noted` is what the toolbar dot reads without pretending a page is showing anything. The write comes
+  *before* `notifications.create()`, because the listener clears the OS copy on any `open:false` — after the
+  toast exists, that race would delete the notification it just raised.
 - **The notification is the same reminder in OS clothing.** Same heading, same `SNOOZE` length, and two
   buttons that reuse the bubble's own paths (`drinkFromNote()`, `armSnooze()`). It has no bear, no caption
   and no animation: what the page adds is exactly what is lost there.
@@ -212,8 +227,11 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
   rather than writing a "paused" notice.
 - **Reaching the goal** starts a confetti emitter (4 pieces every 220ms, five shapes, `#confetti` a
   140px absolutely positioned strip so the popup height does not change) and adds `done` to `body`:
-  a ✓ on the count, green text, and the bar switching to `#5f8f4f`. Start and stop are idempotent and
-  both bail under `prefers-reduced-motion`.
+  a ✓ on the count, green text, and the bar switching to `#5f8f4f`. Start and stop are idempotent.
+  **Confetti is the one deliberate exception to `prefers-reduced-motion`** — Windows's *Animation effects*
+  switch reaches Chrome as that media query, and honouring it meant a goal met with nothing on screen, which
+  reads as a broken popup. It is a short celebration the user asked for by finishing the day, so it always
+  runs; the reduced-motion block in `style.css` still stops everything ambient (blink, bob, sparks, straw).
 - **The toolbar carries no number** — a dot while a reminder is pending, plus the hover tooltip rebuilt
   from storage: `Bubu's Water Club — 5 of 8 glasses today`.
 - **Popup sizing:** bear box 176.25px, tracker ~463px tall, settings ~532px — inside Chrome's 600px cap.
@@ -224,16 +242,17 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
   `onInstalled` (which also seeds storage when empty), `onStartup`, and `storage.onChanged` for
   `interval` / `enabled` / `stopAtGoal`.
 - On `water` or `snooze`: `remind()` refreshes the badge, re-reads state and bails if `enabled` is off,
-  `inQuiet(state)` is true, or `stopAtGoal && glasses >= goal`. Otherwise it broadcasts `DUDU_REMIND` to
-  every tab matching `^(https?|file):`, carrying one `at` stamp for the whole round, and then falls back to
-  `notify()` when `visiblePage()` says no page can show it.
+  `inQuiet(state)` is true, or `stopAtGoal && glasses >= goal`. Otherwise it asks `visiblePage()`: if a page
+  qualifies it broadcasts `DUDU_REMIND` to every tab matching `^(https?|file):`, carrying one `at` stamp for
+  the whole round; if not, it calls `notify()` and returns without broadcasting.
 - **The notification has no page to roll the day over**, so `drinkFromNote()` archives the day it leaves the
   way `popup.js` and `content.js` do, stamps `syncAt` like any other glass, and writes `bubble.open:false`
   so a reminder left up in another tab cannot outlive the answer. `clearNote()` also runs on any `glasses`
   change, so drinking from the popup or the bubble takes the OS copy down with it.
-- **The badge shows a dot, not a number,** while `bubble.open` is set and the day is not settled: on
-  `chrome://` pages and the new-tab page it is the only signal there is. It clears through the same path as
-  the bubble, because every dismissal writes `bubble.open:false`.
+- **The badge shows a dot, not a number,** while `bubble.open` *or* `bubble.noted` is set and the day is not
+  settled — a page bubble and an OS reminder both count, and on a `chrome://` page the dot is all there is.
+  It clears when the reminder is answered: a glass drunk anywhere calls `clearNoted()`, and a dismissal writes
+  `bubble.open:false` through `hide()`.
 - **Quiet hours are a fire-time check**, not a scheduling one, so a 3am alarm costs nothing and the
   cadence is untouched. The same guard covers the snooze alarm.
 - **Snooze:** a content script has no `chrome.alarms`, so the bubble's *Snooze 10 min* sends
@@ -246,6 +265,10 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
   waiting in a background tab, and in lone mode the host is hidden with it. The bubble's own *Snooze* passes
   `closeBubble:false` instead — it has already written `open:false` before sending, and a second write would
   cut short the 180ms fade happening in the tab the user tapped.
+- **Install reaches the tabs that were already open.** `onInstalled` ends with `injectOpenTabs()`, which runs
+  `preload.js`, `lines.js`, `content.js` into every `^(https?|file):` tab through `chrome.scripting` — Chrome
+  itself only injects into documents loaded after the install. It runs after the pull, the seeding and
+  `schedule()`, so the tabs read the final state; content.js's own load guard makes a second copy a no-op.
 - **Cross-device mirror.** `syncNow(dir)` runs on a local change to a synced key, on
   `storage.sync.onChanged`, and after install/start. It reads both stores and writes only what differs:
   settings by `syncMeta`, the count by `syncCount()`, history by union, `syncMeta` by max.
@@ -253,7 +276,13 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
 
 ### Content script (`content.js`)
 
-- Guarded by `window.__duduWaterLoaded`; `mount()` creates a fixed-position host
+- **Guarded by a version stamp, not a plain flag.** `window.__duduWaterVersion` is compared with `V` — bump it
+  whenever the file changes shape. Equal means this page already runs this build; different means an older
+  copy is in the page and gets `window.__duduWaterTeardown()` first: timers cleared, host removed, `dead` set
+  so its listeners and `ensure()` stay quiet. A copy older than that teardown has none, so its host is removed
+  by id (`#dudu-water-companion`, the handle a closed shadow root cannot hide) and its listeners are left
+  touching detached nodes.
+- `mount()` creates a fixed-position host
   (`right:22px; bottom:24px; z-index:2147483647; touch-action:none`), attaches a **closed** shadow root
   and writes markup + CSS via `innerHTML`. `ensure()` runs the lazy `window.__bubuLoadAssets` first, so
   the two asset requests happen only when the widget is about to be drawn.
@@ -365,8 +394,10 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
 2. **`enabled` ≠ `floating`.** `enabled` off stops reminders but leaves the bear; `floating` off hides
    the bear while reminders still arrive as a lone bubble.
 3. **× turns Floating Bubu off globally** — it is a shortcut for the popup's toggle, not a per-tab hide.
-4. **Reloading the extension does not re-inject into open tabs**, so hide/drag/drink appear broken there
-   until the page is reloaded.
+4. **Install and update both reach tabs that were already open** (`injectOpenTabs()`), and content.js's
+   version stamp makes an update *replace* the running copy instead of being skipped — the older copy is torn
+   down first. Editing a content script by hand still needs a page refresh (and a `V` bump), because only
+   `onInstalled` runs `injectOpenTabs()` and a reload from `chrome://extensions` does not always fire it.
 5. **Defaults are triplicated** across the three files, and `BEARS`/`BEAR_NAMES`/the `data-bear`
    whitelist must agree. `SYNCED` lives only in `background.js`.
 6. **Sync is best-effort.** `chrome.storage.sync` needs Chrome sign-in; otherwise values stay on that

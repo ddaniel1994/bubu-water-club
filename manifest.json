@@ -12,8 +12,14 @@
   "permissions": [
     "alarms",
     "notifications",
+    "scripting",
     "storage",
     "tabs"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "file:///*"
   ],
   "action": {
     "default_popup": "popup.html",

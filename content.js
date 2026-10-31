@@ -1,11 +1,25 @@
 (() => {
-  if (window.__duduWaterLoaded) return;
+  // A version stamp, not a bare flag: `injectOpenTabs()` re-runs this file into the tabs that were open at
+  // install or update time, so a page that already holds an OLDER build has to upgrade rather than be skipped.
+  // Bump `V` whenever this file changes shape — a tab keeps the copy it booted with otherwise.
+  const V = 3;
+  if (window.__duduWaterVersion === V) return;
+  window.__duduWaterTeardown?.();
+  // The build before this one has no teardown, but its host is still in the page: the id is the one handle a
+  // closed shadow root cannot hide. Removing it is enough — the retired copy's listeners only ever touch
+  // detached nodes afterwards, and its DOM handlers go with the node.
+  if (document.documentElement) document.getElementById('dudu-water-companion')?.remove();
+  window.__duduWaterVersion = V;
   window.__duduWaterLoaded = true;
   const defaults = {enabled:true, floating:true, glasses:0, goal:8, lastDay:'', stopAtGoal:false, history:[], pos:{right:22,bottom:24}, bubble:{open:false,at:0}, syncAt:0, syncMeta:{}, snoozeUntil:0, bear:'bubu'};
   let state = {...defaults};
-  let host, root, wrap, bubble, count, bearEl, bearBox = null, timer2, timer3, timer4, hidden = false, lastLine = -1, dragging = false, wasDone = false, known = false, onRemind = null;
+  let host, root, wrap, bubble, count, bearEl, bearBox = null, timer2, timer3, timer4, hidden = false, lastLine = -1, dragging = false, wasDone = false, known = false, onRemind = null, dead = false;
   const day = () => new Date().toLocaleDateString('en-CA');
   const safe = n => Number.isFinite(Number(n)) ? Number(n) : 0;
+  // The other half of the version stamp above: a build can be replaced while its page lives on, so this stops
+  // its timers, takes its host out of the page and sets `dead`, which every listener and `ensure()` checks.
+  // The retired copy then writes no state and cannot mount a second bear next to the new one.
+  window.__duduWaterTeardown = () => {dead = true; [timer2, timer3, timer4, timer5].forEach(clearTimeout); if (host) host.remove(); host = null;};
   // The stylesheet and drawing are fetched on demand, never at page load: two extension-resource
   // requests are the expensive half of the widget, and a page that never draws it should not pay for
   // them. preload.js publishes the memoised loader in this same isolated world; the fallback covers a
@@ -37,6 +51,7 @@
   const LINES = globalThis.BUBU_LINES || [];
   async function refresh() {
     state = await chrome.storage.local.get(defaults);
+    if (dead) return;
     if (state.floating) hidden = false;   // re-enabled in the popup → come back without a reload
     bearBox = null; fit(state.pos);
     // Rollover archives the day that just ended so the popup's week strip and streak have data even
@@ -73,7 +88,7 @@
     wasDone = done; known = true;
   }
   function mount() {
-    if (host || !document.documentElement) return;
+    if (host || dead || !document.documentElement) return;
     host = document.createElement('div'); host.id='dudu-water-companion';
     host.style.cssText='position:fixed;right:22px;bottom:24px;z-index:2147483647;display:none;touch-action:none;';
     root=host.attachShadow({mode:'closed'});
@@ -138,7 +153,7 @@
       else{bubble.classList.remove('show');if(!state.floating)host.style.display='none';}
       saveBubble(false);};
     const applyBubble=b=>{if(!b||!b.open||!b.at||b.at===bubbleAt||dragging||!canShow())return;bubbleAt=b.at;if(Number.isInteger(b.line)&&LINES[b.line]){lastLine=b.line;lineEl.textContent=LINES[lastLine];}unout();if(!state.floating)host.style.display='block';bubble.classList.add('show');place();};
-    chrome.storage.onChanged.addListener((changes,area)=>{if(area!=='local'||!changes.bubble)return;const b=changes.bubble.newValue||{};state.bubble=b;if(b.at===bubbleAt)return;
+    chrome.storage.onChanged.addListener((changes,area)=>{if(area!=='local'||!changes.bubble||dead)return;const b=changes.bubble.newValue||{};state.bubble=b;if(b.at===bubbleAt)return;
       if(b.open)applyBubble(b);else{bubbleAt=b.at||0;bubble.classList.remove('show');if(!state.floating)host.style.display='none';}});
     const bear=root.querySelector('.bear');bearEl=bear;
     // Eyes track the cursor anywhere on the page (same mapping as the popup) and hold that look until
@@ -198,16 +213,21 @@
   // Mounting is on demand. With Floating Bubu off, a page pays for one storage read (which still rolls the
   // day over) and two listeners — no shadow root, no asset fetch, no animation tree. Enabling the bear
   // again, or a reminder arriving, draws it then.
-  const ensure = () => host ? refresh() : loadAssets().then(() => { mount(); return refresh(); });
+  const ensure = () => dead ? Promise.resolve() : host ? refresh() : loadAssets().then(() => { mount(); return refresh(); });
   // A reminder that is still on screen belongs on every page, including one opened after the broadcast went
   // out: that page never receives a DUDU_REMIND, so the pending record is what asks for the host. A done
   // day with `stopAtGoal`, or reminders switched off, asks for nothing. `mount()` re-reads and shows it.
   const reminderOpen = () => !!state.bubble && !!state.bubble.open && state.enabled && !(state.stopAtGoal && safe(state.glasses) >= safe(state.goal));
-  chrome.runtime.onMessage.addListener(message => {
+  chrome.runtime.onMessage.addListener((message, _sender, reply) => {
+    if (dead) return;
+    // Asked before a reminder is routed, because only the page knows whether it is really being looked at: a
+    // Chrome window left behind another application still has this tab active, and the worker cannot tell from
+    // `windows` alone. Answered synchronously, so the channel is not held open.
+    if (message?.type === 'DUDU_PROBE') { reply(document.visibilityState === 'visible' && document.hasFocus()); return; }
     if (message?.type !== 'DUDU_REMIND') return;
     ensure().then(() => onRemind && onRemind(message.at)).catch(() => {});
   });
-  chrome.storage.onChanged.addListener((changes,area)=>{if(area!=='local')return;
+  chrome.storage.onChanged.addListener((changes,area)=>{if(area!=='local'||dead)return;
     if(!Object.keys(changes).some(k=>['floating','glasses','goal','enabled','lastDay','pos','snoozeUntil','bear','bubble'].includes(k)))return;
     refresh().then(()=>{if(!host&&(state.floating||reminderOpen()))ensure();});});
   refresh().then(()=>{if(state.floating||reminderOpen())ensure();});

@@ -94,30 +94,45 @@ const today=()=>new Date().toLocaleDateString('en-CA');
 // and the new-tab page. The count lives in the hover tooltip, rebuilt from storage each time so it cannot
 // show yesterday's glasses after a rollover that happened while no popup was open.
 async function badge(){const s=await chrome.storage.local.get(DEFAULTS);const n=s.lastDay===today()?Number(s.glasses)||0:0,g=Math.max(1,Number(s.goal)||8);
-  const pending=!!(s.bubble&&s.bubble.open)&&!!s.enabled&&!(s.stopAtGoal&&n>=g);
+  // `noted` is a reminder the OS carried: no page is drawing it, but it is just as unanswered — and on a
+  // `chrome://` page the dot is the only thing left to see, which is exactly when it matters.
+  const pending=!!(s.bubble&&(s.bubble.open||s.bubble.noted))&&!!s.enabled&&!(s.stopAtGoal&&n>=g);
   try{await chrome.action.setBadgeText({text:pending?'•':''});}catch{}
   try{await chrome.action.setBadgeBackgroundColor({color:'#a85737'});}catch{}
   const title=pending?`Water time! — ${n} of ${g} glasses today`:`Bubu's Water Club — ${n} of ${g} glasses today`;
   try{await chrome.action.setTitle({title});}catch{}}
 async function schedule(){const s=await chrome.storage.local.get(DEFAULTS);await chrome.alarms.clear('water');if(!s.enabled){await chrome.alarms.clear('snooze');if(s.snoozeUntil)await chrome.storage.local.set({snoozeUntil:0});}if(s.enabled)chrome.alarms.create('water',{delayInMinutes:s.interval,periodInMinutes:s.interval});}
-// A bubble is only a reminder if somebody can see it. A background tab takes the broadcast and writes
-// `bubble.open`, so "a tab exists" is the wrong test; "a tab a person is looking at" is the right one. The
-// window must be focused and not minimised — a bubble in a window behind another app is as unseen as one in
-// a background tab — and its active tab must be a page a content script can live in.
+// A reminder goes to one surface, so the choice has to be made before anything is sent: a broadcast opens the
+// bubble in every tab, and that is exactly what must not happen when the OS is going to draw the toast
+// instead. "A tab exists" is the wrong test — a bubble in a background tab or in a window behind another app
+// is as unseen as no tab at all — so the test is "a tab a person is looking at".
 async function visiblePage(){
   try{
     const w=await chrome.windows.getLastFocused({populate:true});
     if(!w||w.focused===false||w.state==='minimized')return false;
     const t=(w.tabs||[]).find(x=>x.active);
-    return !!(t&&/^(https?|file):/.test(t.url||''));
+    if(!t||!/^(https?|file):/.test(t.url||''))return false;
+    // The window flags are only a proxy: they say Chrome exists with this tab active, not that anyone is
+    // looking at it. The user may be working in another application with Chrome behind it, and then the
+    // bubble is drawn where nobody can see it. So the page is asked itself — `hasFocus()` is false in exactly
+    // that case. A tab that cannot answer has no content script to draw a bubble in (a page kept from before
+    // the extension was reloaded, or a `file://` tab without file-URL access), so it counts as unseen too,
+    // which is what turns a silently lost reminder into a notification.
+    return (await chrome.tabs.sendMessage(t.id,{type:'DUDU_PROBE'}).catch(()=>null))===true;
   }catch{return false}
 }
 const NOTE='bubu-water';
 // `clear` rejects when there is nothing to clear on some platforms, so the promise is swallowed too.
 const clearNote=()=>{try{const p=chrome.notifications.clear(NOTE);if(p&&p.catch)p.catch(()=>{});}catch{}};
-// Same heading, same caption and the same SNOOZE length as the bubble. `line` is the sentence the pages are
-// drawing for this very round — see `remind()` — so the notification can never read differently from the bubble
-// waiting in a background tab. The OS draws it, so the bear's mood does not carry over, and `requireInteraction`
+// The dot also stands for a reminder the OS carried (`bubble.noted`), and a glass drunk anywhere — the popup, a
+// page bubble, the toast itself — answers it. Clearing it in one place keeps every route out of a reminder
+// honest, including the popup's, which never touches `bubble` at all.
+const clearNoted=()=>{chrome.storage.local.get({bubble:{}}).then(({bubble:b})=>{
+  if(b&&b.noted)return chrome.storage.local.set({bubble:{...b,open:false,noted:false,at:Date.now()}});
+}).catch(()=>{});};
+// The same heading, the same caption and the same SNOOZE length as the bubble it stands in for, so the reminder
+// reads the same whichever surface delivers it. `line` is the sentence the pages would have drawn for this very
+// round — see `remind()`. The OS draws it, so the bear's mood does not carry over, and `requireInteraction`
 // keeps it on screen until it is answered, which is what the bubble does.
 async function notify(line){
   const s=await chrome.storage.local.get(DEFAULTS);
@@ -133,13 +148,13 @@ async function notify(line){
 // left on screen in some other tab cannot outlive the answer.
 async function drinkFromNote(){
   const s=await chrome.storage.local.get(DEFAULTS),d=today(),fresh=s.lastDay===d;
-  const patch={glasses:(fresh?Number(s.glasses)||0:0)+1,lastDay:d,syncAt:Date.now(),bubble:{...(s.bubble||{}),open:false,at:Date.now()}};
+  const patch={glasses:(fresh?Number(s.glasses)||0:0)+1,lastDay:d,syncAt:Date.now(),bubble:{...(s.bubble||{}),open:false,noted:false,at:Date.now()}};
   if(s.lastDay&&!fresh)patch.history=mergeHist(s.history,[{day:s.lastDay,glasses:Number(s.glasses)||0,goal:Number(s.goal)||1}]);
   await chrome.storage.local.set(patch).catch(()=>{});
 }
 // Snoozing closes the reminder on every surface, not only the one that was tapped. From the OS notification
 // there is no page to hide, but the same round may have drawn a bubble in a background tab — the broadcast
-// reaches every tab — and leaving that up for the 30s would contradict the snooze. The bubble's own button
+// reaches every tab — and leaving that up for the whole snooze would contradict it. The bubble's own button
 // runs the other way round: it hides first and then sends `DUDU_SNOOZE`, which arrives here as
 // `closeBubble:false` because there is nothing left for this side to close.
 async function armSnooze(closeBubble=true){
@@ -151,13 +166,16 @@ async function armSnooze(closeBubble=true){
   // instead of finishing its 180ms fade.
   if(closeBubble){
     const s=await chrome.storage.local.get({bubble:{open:false,at:0}}).catch(()=>({}));
-    if(s&&s.bubble&&s.bubble.open)patch.bubble={...s.bubble,open:false,at:Date.now()};
+    const b=s&&s.bubble;
+    // `noted` counts as open here: a reminder the OS carried has no bubble to close, but the dot it raised is
+    // the same unanswered reminder, and a snooze answers it.
+    if(b&&(b.open||b.noted))patch.bubble={...b,open:false,noted:false,at:Date.now()};
   }
   await chrome.storage.local.set(patch).catch(()=>{});
 }
-// Two surfaces, one decision. The bubble is preferred because it is the bear; the OS notification covers what a
-// page cannot — no `http` tab at all, only `chrome://` or the new-tab page, or a Chrome window that is
-// minimised or behind another app.
+// Two surfaces, one decision, and only one of them is used. The bubble is preferred because it is the bear; the
+// OS notification covers what a page cannot — no `http` tab at all, only `chrome://` or the new-tab page, or a
+// Chrome window that is minimised or behind another app.
 // One broadcast for both alarm kinds: the repeating `water` timer and a one-shot `snooze`, so a
 // snoozed reminder appears exactly like a normal one. `at` is stamped once per broadcast and travels to
 // every tab: the widget derives its caption from it, so all the open reminders read the same line.
@@ -167,27 +185,59 @@ async function remind(){
   if(!s.enabled||inQuiet(s)||(s.stopAtGoal&&Number(s.glasses)>=Number(s.goal)))return;
   const at=Date.now();
   // Chosen here, from the state the pages are about to read: same stamp, same previous line, same index, so the
-  // notification carries the sentence the bubble is showing. It has to be picked *before* the broadcast, because
-  // the broadcast is what overwrites `bubble.line` with the new one.
+  // notification carries the sentence the bubble would have shown. It has to be picked *before* the broadcast,
+  // because the broadcast is what overwrites `bubble.line` with the new one.
   const lines=globalThis.BUBU_LINES||[],pick=globalThis.bubuLine;
   const prev=Number.isInteger(s.bubble&&s.bubble.line)?s.bubble.line:-1;
-  const line=pick?lines[pick(at,prev,lines.length)]||'':'';
+  const idx=pick&&lines.length?pick(at,prev,lines.length):-1;
+  const line=idx>=0?lines[idx]||'':'';
+  // One surface, never both. The broadcast opens the bubble in every tab (`bubble.open`), so when no page is in
+  // sight it is skipped entirely and the alarm is spent on the notification: a toast the user answers with its
+  // own buttons must not also leave a bubble waiting behind it, asking the same question again when they come
+  // back to a page.
+  if(!(await visiblePage())){
+    // The OS owns this round, so no page may raise a bubble for it — and `open:false` also retires a bubble from
+    // an earlier round the user never answered, which would otherwise be waiting on the next page they open.
+    // `noted` keeps the toolbar dot honest without pretending a page is showing it, and `line` is recorded so
+    // the next round skips the sentence this one just used: with nothing written, `prev` never moved and two
+    // notifications in a row could repeat the same caption.
+    // This write has to land *before* `notify()`: the listener clears the OS copy on any `open:false`, and once
+    // the toast exists that race would delete the notification it just raised.
+    await chrome.storage.local.set({bubble:{open:false,at,line:idx,noted:true}}).catch(()=>{});
+    await notify(line);
+    return;
+  }
   const tabs=await chrome.tabs.query({});
   await Promise.all(tabs.filter(t=>/^(https?|file):/.test(t.url||'')).map(t=>chrome.tabs.sendMessage(t.id,{type:'DUDU_REMIND',at}).catch(()=>{})));
-  // The broadcast still reaches every page, so coming back to a tab finds the reminder waiting there. But if
-  // no visible page could show it, the alarm has to be spent on the notification or it is spent on nothing.
-  if(!(await visiblePage()))await notify(line);
+}
+// Chrome injects the declarative content scripts only into documents loaded after the install, so every tab
+// that was already open when the extension arrived would sit there with no bear until it was reloaded. This
+// reaches them: the same three files, in the same order, into the same isolated world, where content.js's
+// `window.__duduWaterLoaded` guard turns the second copy into a no-op — an install over a page that already
+// has the widget is harmless. A tab that closes mid-loop, or a `file://` page without file-URL access, refuses
+// the call; that is "this page gets no bear", never a reason to stop reaching the others.
+async function injectOpenTabs(){
+  if(!chrome.scripting)return;
+  const tabs=await chrome.tabs.query({}).catch(()=>[]);
+  for(const t of tabs){
+    if(!/^(https?|file):/.test(t.url||''))continue;
+    for(const f of ['preload.js','lines.js','content.js']){
+      try{await chrome.scripting.executeScript({target:{tabId:t.id},files:[f]});}catch{break;}
+    }
+  }
 }
 // Pull before seeding, so a fresh install in a signed-in browser adopts the account's settings instead
 // of writing the defaults over them. `schedule()` runs after the pull for the same reason: the interval
-// may have just changed.
-chrome.runtime.onInstalled.addListener(async()=>{await pullSync();const s=await chrome.storage.local.get(null);if(!Object.keys(s).length)await chrome.storage.local.set(DEFAULTS);await schedule();await badge();await pushSync();});
+// may have just changed. The open tabs are reached last, once the state they will read is in place.
+chrome.runtime.onInstalled.addListener(async()=>{await pullSync();const s=await chrome.storage.local.get(null);if(!Object.keys(s).length)await chrome.storage.local.set(DEFAULTS);await schedule();await badge();await pushSync();await injectOpenTabs();});
 chrome.runtime.onStartup.addListener(async()=>{await pullSync();await schedule();await badge();await pushSync();});
 chrome.storage.onChanged.addListener((changes,area)=>{if(area!=='local')return;if(changes.interval||changes.enabled||changes.stopAtGoal)schedule();
   if(changes.glasses||changes.goal||changes.lastDay||changes.enabled||changes.bubble)badge();
   // Answered somewhere else — a glass logged in the popup, or the bubble dismissed on a page — so the OS copy
-  // must not linger. A reminder *opening* writes `open:true` and deliberately clears nothing: the broadcast
-  // is still settling when `notify()` runs, and a race there would delete the notification it just raised.
+  // must not linger. A reminder *opening* clears nothing (opening is not an answer), and neither does a round
+  // handing itself to the OS (`noted`, written just before its toast is created).
+  if(changes.bubble&&changes.bubble.newValue&&changes.bubble.newValue.noted)return;
+  if(changes.glasses)clearNoted();
   if(changes.glasses||(changes.bubble&&changes.bubble.newValue&&changes.bubble.newValue.open===false))clearNote();});
 // The mirror's own trigger: a local change to a synced key goes up, an incoming sync value comes down.
 // Writes from `pullSync` land back here, where `pushSync` finds nothing left to send and stops.
