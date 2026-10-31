@@ -1,0 +1,26 @@
+# OS clutter
+.DS_Store
+.DS_Store?
+Thumbs.db
+desktop.ini
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Packaged builds and signing keys — the extension is loaded from source
+*.zip
+*.crx
+*.pem
+*.deb
+
+# Local scratch, logs and probe output
+*.log
+tmp/
+.tmp/
+*.local.json
+
+# Dependency tree, if tooling is ever run here
+node_modules/
