@@ -31,7 +31,10 @@
   const fit = p => {bearBox = null; if (dragging || !host) return; const r = p && Number.isFinite(p.right) ? p.right : 22, b = p && Number.isFinite(p.bottom) ? p.bottom : 24, w = host.offsetWidth || 152, h = host.offsetHeight || 152;host.style.right=Math.max(0,Math.min(innerWidth-w,r))+'px';host.style.bottom=Math.max(0,Math.min(innerHeight-h,b))+'px';};
   // One caption per reminder, picked at random and never the same twice in a row. The heading above it
   // stays fixed so the reminder is still recognisable at a glance.
-  const LINES = ['Bubu, thanni kudichiya?','Thanni kudi kunjipenne','Konjam thanni kudi papa','Did my good girl drink water?','Papa, oru cutting?','Vellam kudicho muthe?','Vellam kudikkan maranno?','Vellam kudikkan samayamaayi!','Thanni kudichiya chellam?','Konjam thanni kudichukko!'];
+  // The sentences and the function that picks one live in `lines.js`, which the worker loads as well: the OS
+  // notification has to read the same line as the bubble for the same reminder, so there is one list and one
+  // picker rather than two copies that can drift.
+  const LINES = globalThis.BUBU_LINES || [];
   async function refresh() {
     state = await chrome.storage.local.get(defaults);
     if (state.floating) hidden = false;   // re-enabled in the popup → come back without a reload
@@ -99,19 +102,18 @@
       .cheer .bear{animation:cheer .45s ease-in-out 3}
       @keyframes bob{50%{transform:rotate(var(--tilt,0deg)) translateY(-6px)}}@keyframes gulp{0%,100%{transform:rotate(var(--tilt,0deg)) translateY(0) scale(1)}30%{transform:rotate(var(--tilt,0deg)) translateY(2px) scale(.985)}65%{transform:rotate(var(--tilt,0deg)) translateY(-1px) scale(1)}}@keyframes pop{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:scale(1)}}@keyframes cheer{25%{transform:translateY(-9px) rotate(-7deg)}75%{transform:translateY(-4px) rotate(7deg)}}@keyframes fadeOut{to{opacity:0;transform:scale(.96)}}
       @media(prefers-reduced-motion:reduce){.bear,.blink,.cheer .bear,.bubble.show,.bubble.out,.spark,.snoozing .snz,.straw,.sip,.sheen,.band,.tail{animation:none!important}.bear[data-bear="hearts"] .hearts,.bear[data-bear="hearts"] .hearts path{animation:none!important}.bear.done .spark,.bear[data-bear="crown"] .crown,.bear[data-bear="bow"] .bow,.bear[data-bear="buckethat"] .buckethat{animation:none!important}.eye,.mouth,.coffee,.sheen{transition:none!important}}
-    </style><div class="wrap"><div class="bubble" role="status" aria-live="polite"><strong>Water time!</strong><small>Bubu, thanni kudichiya?</small><div class="row"><button class="drink-btn">I drank water!</button><button class="dismiss"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8.6" r="5.4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 5.6V8.6L10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.4 2.7L2.3 3.8M12.6 2.7L13.7 3.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>Snooze 30s</button></div></div><div class="bear" aria-hidden="true"><span class="zzz" aria-hidden="true"></span><span class="snz" aria-hidden="true"><svg viewBox="0 0 16 16"><circle cx="8" cy="8.6" r="5.6" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M8 5.4V8.6L10.1 10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="spark s1" aria-hidden="true">✦</span><span class="spark s2" aria-hidden="true">✦</span>${assets.svg}</div><button class="hide">×</button><div class="count"></div></div>`;
+    </style><div class="wrap"><div class="bubble" role="status" aria-live="polite"><strong>Water time!</strong><small>Bubu, thanni kudichiya?</small><div class="row"><button class="drink-btn">I drank water!</button><button class="dismiss"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8.6" r="5.4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 5.6V8.6L10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.4 2.7L2.3 3.8M12.6 2.7L13.7 3.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>Snooze 10 min</button></div></div><div class="bear" aria-hidden="true"><span class="zzz" aria-hidden="true"></span><span class="snz" aria-hidden="true"><svg viewBox="0 0 16 16"><circle cx="8" cy="8.6" r="5.6" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M8 5.4V8.6L10.1 10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="spark s1" aria-hidden="true">✦</span><span class="spark s2" aria-hidden="true">✦</span>${assets.svg}</div><button class="hide">×</button><div class="count"></div></div>`;
     document.documentElement.appendChild(host);
     wrap=root.querySelector('.wrap');bubble=root.querySelector('.bubble');count=root.querySelector('.count');
     const lineEl=root.querySelector('.bubble small');
-    // Uniform over every line except the one on screen: re-rolling inside the remaining n-1 (rather than
-    // stepping to i+1) keeps the choice flat, so no line is likelier to follow another.
-    // One caption per reminder, derived from the reminder's shared stamp rather than rolled per tab: every
-    // open tab feeds the same number into the same hash, so the bubbles read identically with no extra
-    // storage round-trip. The avalanche keeps the sequence from tracking the alarm interval, and the
-    // previous line — read from storage, so tabs agree on it — is skipped so none repeats back to back.
-    const say=stamp=>{const n=LINES.length;if(!n)return;const prev=Number.isInteger(state.bubble&&state.bubble.line)?state.bubble.line:lastLine;
-      let h=(Number(stamp)||0)^0x9e3779b9;h=Math.imul(h^(h>>>16),0x85ebca6b);h=Math.imul(h^(h>>>13),0xc2b2ae35);h^=h>>>16;
-      let i=(h>>>0)%n;if(n>1&&i===prev)i=(i+1+((h>>>8)%(n-1)))%n;lastLine=i;lineEl.textContent=LINES[i];};
+    // One caption per reminder, derived from the reminder's shared stamp rather than rolled per tab: every open
+    // tab feeds the same number into `bubuLine()` (lines.js), so the bubbles read identically with no extra
+    // storage round-trip, and the worker calls the same function with the same stamp and previous line to
+    // caption the OS notification. The previous line — read from storage, so tabs agree on it — is skipped so
+    // none repeats back to back, and the re-roll inside the remaining n-1 keeps the choice flat.
+    const say=stamp=>{const n=LINES.length;if(!n||!globalThis.bubuLine)return;
+      const i=bubuLine(stamp,Number.isInteger(state.bubble&&state.bubble.line)?state.bubble.line:lastLine,n);
+      lastLine=i;lineEl.textContent=LINES[i];};
     // The bubble is shared like the bear's position: opening or closing the reminder in one tab does the
     // same in every tab, so it can never be up in one and missing in another. `at` is the write stamp —
     // a tab ignores the change it wrote itself.
@@ -137,7 +139,7 @@
       saveBubble(false);};
     const applyBubble=b=>{if(!b||!b.open||!b.at||b.at===bubbleAt||dragging||!canShow())return;bubbleAt=b.at;if(Number.isInteger(b.line)&&LINES[b.line]){lastLine=b.line;lineEl.textContent=LINES[lastLine];}unout();if(!state.floating)host.style.display='block';bubble.classList.add('show');place();};
     chrome.storage.onChanged.addListener((changes,area)=>{if(area!=='local'||!changes.bubble)return;const b=changes.bubble.newValue||{};state.bubble=b;if(b.at===bubbleAt)return;
-      if(b.open)applyBubble(b);else{bubbleAt=b.at||0;bubble.classList.remove('show');}});
+      if(b.open)applyBubble(b);else{bubbleAt=b.at||0;bubble.classList.remove('show');if(!state.floating)host.style.display='none';}});
     const bear=root.querySelector('.bear');bearEl=bear;
     // Eyes track the cursor anywhere on the page (same mapping as the popup) and hold that look until
     // the pointer leaves, so a blink never pulls them back to centre. The bear's box is cached and a burst
@@ -156,7 +158,7 @@
     const show=stamp=>{if(!canShow())return;say(stamp);unout();host.style.display='block';bubble.classList.add('show');place();wrap.classList.remove('drink');saveBubble(true,stamp)};
     root.querySelector('.drink-btn').onclick=async()=>{await refresh();await chrome.storage.local.set({glasses:safe(state.glasses)+1,lastDay:day(),syncAt:Date.now()});wrap.classList.remove('drink');void wrap.offsetWidth;wrap.classList.add('drink');clearTimeout(timer3);timer3=setTimeout(()=>wrap.classList.remove('drink'),820);hide();};
     // Snooze dismisses and re-arms: a content script has no chrome.alarms, so the service
-    // worker arms a one-shot `snooze` alarm that re-broadcasts DUDU_REMIND after 30 seconds.
+    // worker arms a one-shot `snooze` alarm that re-broadcasts DUDU_REMIND after 10 minutes.
     root.querySelector('.dismiss').onclick=()=>{hide(true);chrome.runtime.sendMessage({type:'DUDU_SNOOZE'}).catch(()=>{});};
     // × is the global off switch for the bear: it hides instantly, then turns the Floating Bubu
     // setting off so he stays gone on every page (and the popup's toggle follows).

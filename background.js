@@ -1,11 +1,15 @@
+// A classic service worker, so the shared reminder copy can be pulled in directly: the same list and the same
+// picker the page bubble uses, which is what keeps the notification and the bubble on one sentence.
+importScripts('lines.js');
 const DEFAULTS={interval:45,enabled:true,glasses:0,goal:8,lastDay:'',floating:true,quiet:false,quietFrom:22,quietTo:7,stopAtGoal:false,syncAt:0,syncMeta:{},snoozeUntil:0};
 // Quiet hours are checked when a reminder would fire, not when the alarm is scheduled, so the repeating
 // timer keeps its cadence and simply goes quiet inside the window. A window that wraps midnight
 // (22 → 7) is the normal case; identical hours mean no window at all rather than 24h of silence.
 const inQuiet=(s,now=new Date())=>{if(!s.quiet)return false;const f=Number(s.quietFrom),t=Number(s.quietTo),h=now.getHours();if(!Number.isFinite(f)||!Number.isFinite(t)||f===t)return false;return f<t?h>=f&&h<t:h>=f||h<t;};
-const SNOOZE=30; // seconds the bubble's "Snooze 30s" postpones a single reminder — keep in step with the button label
-// 30s is the floor of Chrome's alarm granularity, so the snooze is armed with `when` (an absolute stamp)
-// instead of `delayInMinutes`: the delay the button promises is the delay that actually runs.
+const SNOOZE=600; // seconds the bubble's "Snooze 10 min" postpones a single reminder — keep in step with the button label
+// Ten minutes is well clear of Chrome's 30s alarm granularity, so `delayInMinutes` would work; the alarm uses an
+// absolute `when` instead because that is also the stamp `snoozeUntil` carries, which is what the clock badge on
+// the bear counts down — one number for the wait and the badge.
 // ---- Cross-device sync -------------------------------------------------------------------------
 // `chrome.storage.local` stays the single source of truth every context reads, so the popup, the widget
 // and the reminder logic need no knowledge of sync: this worker mirrors the account-wide keys into
@@ -85,34 +89,121 @@ async function syncNow(dir){
 async function pushSync(){return syncNow('push');}
 async function pullSync(){return syncNow('pull');}
 const today=()=>new Date().toLocaleDateString('en-CA');
-// The toolbar carries no number: the icon stays exactly the bear, so nothing covers the art at 16px.
-// The only count in the toolbar is the hover tooltip, rebuilt from storage each time so it cannot show
-// yesterday's glasses after a rollover that happened while no popup was open. `setBadgeText('')` is kept
-// so a badge left behind by an older build is cleared once.
+// The toolbar carries no number: the icon stays exactly the bear, so nothing covers the art at 16px. It does
+// carry a single dot while a reminder is waiting, which is the only surface that exists on `chrome://` pages
+// and the new-tab page. The count lives in the hover tooltip, rebuilt from storage each time so it cannot
+// show yesterday's glasses after a rollover that happened while no popup was open.
 async function badge(){const s=await chrome.storage.local.get(DEFAULTS);const n=s.lastDay===today()?Number(s.glasses)||0:0,g=Math.max(1,Number(s.goal)||8);
-  try{await chrome.action.setBadgeText({text:''});}catch{}
-  const title=`Bubu's Water Club — ${n} of ${g} glasses today`;try{await chrome.action.setTitle({title});}catch{}}
+  const pending=!!(s.bubble&&s.bubble.open)&&!!s.enabled&&!(s.stopAtGoal&&n>=g);
+  try{await chrome.action.setBadgeText({text:pending?'•':''});}catch{}
+  try{await chrome.action.setBadgeBackgroundColor({color:'#a85737'});}catch{}
+  const title=pending?`Water time! — ${n} of ${g} glasses today`:`Bubu's Water Club — ${n} of ${g} glasses today`;
+  try{await chrome.action.setTitle({title});}catch{}}
 async function schedule(){const s=await chrome.storage.local.get(DEFAULTS);await chrome.alarms.clear('water');if(!s.enabled){await chrome.alarms.clear('snooze');if(s.snoozeUntil)await chrome.storage.local.set({snoozeUntil:0});}if(s.enabled)chrome.alarms.create('water',{delayInMinutes:s.interval,periodInMinutes:s.interval});}
+// A bubble is only a reminder if somebody can see it. A background tab takes the broadcast and writes
+// `bubble.open`, so "a tab exists" is the wrong test; "a tab a person is looking at" is the right one. The
+// window must be focused and not minimised — a bubble in a window behind another app is as unseen as one in
+// a background tab — and its active tab must be a page a content script can live in.
+async function visiblePage(){
+  try{
+    const w=await chrome.windows.getLastFocused({populate:true});
+    if(!w||w.focused===false||w.state==='minimized')return false;
+    const t=(w.tabs||[]).find(x=>x.active);
+    return !!(t&&/^(https?|file):/.test(t.url||''));
+  }catch{return false}
+}
+const NOTE='bubu-water';
+// `clear` rejects when there is nothing to clear on some platforms, so the promise is swallowed too.
+const clearNote=()=>{try{const p=chrome.notifications.clear(NOTE);if(p&&p.catch)p.catch(()=>{});}catch{}};
+// Same heading, same caption and the same SNOOZE length as the bubble. `line` is the sentence the pages are
+// drawing for this very round — see `remind()` — so the notification can never read differently from the bubble
+// waiting in a background tab. The OS draws it, so the bear's mood does not carry over, and `requireInteraction`
+// keeps it on screen until it is answered, which is what the bubble does.
+async function notify(line){
+  const s=await chrome.storage.local.get(DEFAULTS);
+  const n=s.lastDay===today()?Number(s.glasses)||0:0,g=Math.max(1,Number(s.goal)||8);
+  try{
+    await chrome.notifications.create(NOTE,{type:'basic',iconUrl:'icon.png',title:'Water time!',
+      message:`${line?line+' — ':''}${n} of ${g} glasses today`,
+      priority:2,requireInteraction:true,buttons:[{title:'I drank water!'},{title:`Snooze ${SNOOZE/60} min`}]});
+  }catch(e){console.warn('[Bubu] notification failed',e)}
+}
+// A glass drunk from the notification has no page to run the rollover, so it happens here: the day being left
+// behind is archived exactly as `popup.js` and `content.js` archive it, and `bubble` is closed so a reminder
+// left on screen in some other tab cannot outlive the answer.
+async function drinkFromNote(){
+  const s=await chrome.storage.local.get(DEFAULTS),d=today(),fresh=s.lastDay===d;
+  const patch={glasses:(fresh?Number(s.glasses)||0:0)+1,lastDay:d,syncAt:Date.now(),bubble:{...(s.bubble||{}),open:false,at:Date.now()}};
+  if(s.lastDay&&!fresh)patch.history=mergeHist(s.history,[{day:s.lastDay,glasses:Number(s.glasses)||0,goal:Number(s.goal)||1}]);
+  await chrome.storage.local.set(patch).catch(()=>{});
+}
+// Snoozing closes the reminder on every surface, not only the one that was tapped. From the OS notification
+// there is no page to hide, but the same round may have drawn a bubble in a background tab — the broadcast
+// reaches every tab — and leaving that up for the 30s would contradict the snooze. The bubble's own button
+// runs the other way round: it hides first and then sends `DUDU_SNOOZE`, which arrives here as
+// `closeBubble:false` because there is nothing left for this side to close.
+async function armSnooze(closeBubble=true){
+  const at=Date.now()+SNOOZE*1000;
+  chrome.alarms.create('snooze',{when:at});
+  const patch={snoozeUntil:at};
+  // `false` only when the caller is the bubble, which hid itself before sending: closing it again would land a
+  // second `bubble` write with a newer stamp, and the tab that is mid-fade would drop the reminder instantly
+  // instead of finishing its 180ms fade.
+  if(closeBubble){
+    const s=await chrome.storage.local.get({bubble:{open:false,at:0}}).catch(()=>({}));
+    if(s&&s.bubble&&s.bubble.open)patch.bubble={...s.bubble,open:false,at:Date.now()};
+  }
+  await chrome.storage.local.set(patch).catch(()=>{});
+}
+// Two surfaces, one decision. The bubble is preferred because it is the bear; the OS notification covers what a
+// page cannot — no `http` tab at all, only `chrome://` or the new-tab page, or a Chrome window that is
+// minimised or behind another app.
 // One broadcast for both alarm kinds: the repeating `water` timer and a one-shot `snooze`, so a
 // snoozed reminder appears exactly like a normal one. `at` is stamped once per broadcast and travels to
 // every tab: the widget derives its caption from it, so all the open reminders read the same line.
-async function remind(){await badge();const s=await chrome.storage.local.get(DEFAULTS);if(!s.enabled||inQuiet(s)||(s.stopAtGoal&&Number(s.glasses)>=Number(s.goal)))return;const at=Date.now();const tabs=await chrome.tabs.query({});await Promise.all(tabs.filter(t=>/^(https?|file):/.test(t.url||'')).map(t=>chrome.tabs.sendMessage(t.id,{type:'DUDU_REMIND',at}).catch(()=>{})));}
+async function remind(){
+  await badge();
+  const s=await chrome.storage.local.get(DEFAULTS);
+  if(!s.enabled||inQuiet(s)||(s.stopAtGoal&&Number(s.glasses)>=Number(s.goal)))return;
+  const at=Date.now();
+  // Chosen here, from the state the pages are about to read: same stamp, same previous line, same index, so the
+  // notification carries the sentence the bubble is showing. It has to be picked *before* the broadcast, because
+  // the broadcast is what overwrites `bubble.line` with the new one.
+  const lines=globalThis.BUBU_LINES||[],pick=globalThis.bubuLine;
+  const prev=Number.isInteger(s.bubble&&s.bubble.line)?s.bubble.line:-1;
+  const line=pick?lines[pick(at,prev,lines.length)]||'':'';
+  const tabs=await chrome.tabs.query({});
+  await Promise.all(tabs.filter(t=>/^(https?|file):/.test(t.url||'')).map(t=>chrome.tabs.sendMessage(t.id,{type:'DUDU_REMIND',at}).catch(()=>{})));
+  // The broadcast still reaches every page, so coming back to a tab finds the reminder waiting there. But if
+  // no visible page could show it, the alarm has to be spent on the notification or it is spent on nothing.
+  if(!(await visiblePage()))await notify(line);
+}
 // Pull before seeding, so a fresh install in a signed-in browser adopts the account's settings instead
 // of writing the defaults over them. `schedule()` runs after the pull for the same reason: the interval
 // may have just changed.
 chrome.runtime.onInstalled.addListener(async()=>{await pullSync();const s=await chrome.storage.local.get(null);if(!Object.keys(s).length)await chrome.storage.local.set(DEFAULTS);await schedule();await badge();await pushSync();});
 chrome.runtime.onStartup.addListener(async()=>{await pullSync();await schedule();await badge();await pushSync();});
-chrome.storage.onChanged.addListener((changes,area)=>{if(area!=='local')return;if(changes.interval||changes.enabled||changes.stopAtGoal)schedule();if(changes.glasses||changes.goal||changes.lastDay)badge();});
+chrome.storage.onChanged.addListener((changes,area)=>{if(area!=='local')return;if(changes.interval||changes.enabled||changes.stopAtGoal)schedule();
+  if(changes.glasses||changes.goal||changes.lastDay||changes.enabled||changes.bubble)badge();
+  // Answered somewhere else — a glass logged in the popup, or the bubble dismissed on a page — so the OS copy
+  // must not linger. A reminder *opening* writes `open:true` and deliberately clears nothing: the broadcast
+  // is still settling when `notify()` runs, and a race there would delete the notification it just raised.
+  if(changes.glasses||(changes.bubble&&changes.bubble.newValue&&changes.bubble.newValue.open===false))clearNote();});
 // The mirror's own trigger: a local change to a synced key goes up, an incoming sync value comes down.
 // Writes from `pullSync` land back here, where `pushSync` finds nothing left to send and stops.
 chrome.storage.onChanged.addListener((changes,area)=>{if(area==='sync')pullSync();else if(area==='local'&&(changes.history||changes.glasses||changes.lastDay||SYNCED.some(k=>changes[k])))pushSync();});
 // Firing the snooze clears the badge flag before the reminder goes out, so the clock on the bear is never
 // still counting down a snooze that has already been delivered (or suppressed by quiet hours / a done day).
 chrome.alarms.onAlarm.addListener(a=>{if(a.name!=='water'&&a.name!=='snooze')return;if(a.name==='snooze')chrome.storage.local.set({snoozeUntil:0});remind();});
+// The notification's two buttons are the bubble's two buttons, reached without a page open.
+chrome.notifications.onButtonClicked.addListener((id,i)=>{if(id!==NOTE)return;clearNote();if(i===0)drinkFromNote();else armSnooze();});
+// A click on the body has no answer to record, so it only brings the browser forward.
+chrome.notifications.onClicked.addListener(id=>{if(id!==NOTE)return;clearNote();
+  chrome.windows.getLastFocused().then(w=>{if(w&&w.id!=null)return chrome.windows.update(w.id,{focused:true});}).catch(()=>{});});
 // A content script has no chrome.alarms, so the bubble's snooze button asks us to arm it. Creating
 // the same alarm name again replaces the pending one, so repeated taps cannot stack up reminders.
 chrome.runtime.onMessage.addListener((m,_s,reply)=>{
-  if(m&&m.type==='DUDU_SNOOZE'){const at=Date.now()+SNOOZE*1000;chrome.alarms.create('snooze',{when:at});chrome.storage.local.set({snoozeUntil:at});reply({ok:true});return false;}
+  if(m&&m.type==='DUDU_SNOOZE'){armSnooze(false);reply({ok:true});return false;}
   // A content script's own fetch of a packaged file is made under the PAGE's origin, so a strict page can
   // hand back an empty body — which mounted a headless bear. The worker is an extension context, so it
   // reads the same pair and answers instead.

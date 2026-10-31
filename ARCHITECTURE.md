@@ -31,12 +31,13 @@ ignored, flags included, so the browser's own component extensions are the only 
 | File | Role |
 | --- | --- |
 | `manifest.json` | MV3 config: permissions, action popup, service worker, content script registration |
-| `background.js` | Service worker — reminders, snooze alarm, toolbar tooltip, cross-device sync |
+| `background.js` | Service worker — reminders (page bubble or OS notification), snooze alarm, toolbar dot and tooltip, cross-device sync |
 | `popup.html` | Popup markup (340px wide) |
 | `popup.js` | Popup logic — counting, week strip, streak, settings, confetti |
 | `bear.css` | The mascot's rules: tiers, variants, keyframes (shared by both surfaces) |
 | `bear.svg` | The mascot drawing (single source for both surfaces) |
 | `preload.js` | `document_start` content script: publishes a lazy, memoised loader (`window.__bubuLoadAssets`) for `bear.css` + `bear.svg` |
+| `lines.js` | The reminder copy and `bubuLine()`: loaded by `content.js` (as a content script) and by the worker (`importScripts`), so the bubble and the OS notification pick the same sentence from the same list |
 | `style.css` | Popup chrome: layout, settings, week strip, confetti |
 | `content.js` | Self-contained IIFE: draggable floating bear in a closed shadow root |
 | `icon*.png` | Toolbar icons (128/48/32/16) — raster renders of the mascot, must stay at the root |
@@ -52,11 +53,14 @@ both into its shadow root. Only the widget's chrome (`.wrap`, `.bubble`, `.count
 
 - `alarms` — the repeating reminder timer and the one-shot snooze.
 - `storage` — the shared state record, plus `storage.sync` for the cross-device mirror (same permission).
-- `tabs` — reads `tab.url` to decide which tabs receive a reminder.
+- `tabs` — reads `tab.url` to decide which tabs receive a reminder, and `windows.getLastFocused` to decide
+  whether any of them is actually on screen.
+- `notifications` — the OS fallback when no page can show a reminder. It is a *warning* permission, so an
+  already-installed build has to accept the update before the fallback works.
 - `web_accessible_resources` — `bear.css` + `bear.svg`, because a content script's own `fetch` runs under
   the **page's** origin; `content.js` falls back to the `DUDU_ASSETS` worker call when that returns empty.
 - Content scripts match `http://*/*`, `https://*/*`, `file:///*` in two entries — `preload.js` at
-  `document_start`, `content.js` at `document_idle`. `file://` needs **Allow access to file URLs**;
+  `document_start`; `lines.js` then `content.js` at `document_idle`. `file://` needs **Allow access to file URLs**;
   `chrome://` pages can never be matched and there is no new-tab override.
 
 ---
@@ -89,7 +93,8 @@ One flat `chrome.storage.local` record, shared by every context.
 
 **Defaults are duplicated in three files** — `DEFAULTS` (`background.js`), `get(DEFAULTS)`
 (`popup.js`), `defaults` (`content.js`). Adding or renaming a key means editing all three. Each context
-keeps only what it needs: `background.js` omits `history`/`pos`/`bubble`; `content.js` omits
+keeps only what it needs: `background.js` omits `history`/`pos` but both reads and writes `bubble` (the
+badge dot, and closing the reminder after the notification's drink button); `content.js` omits
 `interval`/`quiet`/`quietFrom`/`quietTo` but carries `stopAtGoal`, which `canShow()` needs.
 
 ### Day rollover
@@ -145,8 +150,14 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
 
 - **Storage is the source of truth.** The popup renders from its in-memory `state` after
   `Object.assign`, and every context re-reads on `storage.onChanged`.
-- **Reminders exist only as page bubbles.** There is no OS-notification path: the worker messages every
-  matching tab and swallows rejections, so a reminder no page can display is lost.
+- **A page if one can show it, the OS otherwise.** The worker messages every matching tab and swallows
+  the rejections, then asks `visiblePage()` whether anyone can see a bubble: the last-focused window must
+  be focused and not minimised, and its active tab must match `^(https?|file):`. If not, it raises a
+  `chrome.notifications` notification. "A tab exists" is not the test — a bubble written into a background
+  tab is invisible, so the test is "a tab a person is looking at".
+- **The notification is the same reminder in OS clothing.** Same heading, same `SNOOZE` length, and two
+  buttons that reuse the bubble's own paths (`drinkFromNote()`, `armSnooze()`). It has no bear, no caption
+  and no animation: what the page adds is exactly what is lost there.
 - **The widget mounts on demand.** A tab where Floating Bubu is off pays one storage read (which still
   rolls the day over) and two listeners and builds nothing — no shadow root, no asset fetch, no
   animation tree. Enabling the bear, or a reminder arriving, mounts it then, which is how a reminder
@@ -173,6 +184,10 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
   would fire `storage.onChanged` in every open tab.
 - `status()` writes `#next` from `chrome.alarms.get('water')`: `Next reminder in ~N min`, an empty line
   when nothing will fire (reminders off, or done with `stopAtGoal`), or `Quiet hours until HH:00`.
+- **`fitInterval()` runs at init**, before the first render: a stored `interval` the picker no longer offers
+  (2 minutes was removed) would otherwise leave the select blank while the old cadence kept firing. It moves
+  the value onto the first remaining choice and stamps `syncMeta.interval`, so it settles across devices like
+  any user edit.
 - **Mood caption:** `data-tier` on `#bear` is `Math.min(9, floor(pct/10))` and the same index fills
   `#mood` from `MOODS`, so words and drawing cannot disagree.
 - **Bear variants** are stepped with ‹ › (`#bearL`/`#bearR`), stored as `bear`, and drawn identically by
@@ -199,8 +214,8 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
   140px absolutely positioned strip so the popup height does not change) and adds `done` to `body`:
   a ✓ on the count, green text, and the bar switching to `#5f8f4f`. Start and stop are idempotent and
   both bail under `prefers-reduced-motion`.
-- **The toolbar carries no number** — only the hover tooltip, rebuilt from storage: `Bubu's Water Club —
-  5 of 8 glasses today`.
+- **The toolbar carries no number** — a dot while a reminder is pending, plus the hover tooltip rebuilt
+  from storage: `Bubu's Water Club — 5 of 8 glasses today`.
 - **Popup sizing:** bear box 176.25px, tracker ~463px tall, settings ~532px — inside Chrome's 600px cap.
 
 ### Background (`background.js`)
@@ -208,16 +223,29 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
 - Schedules a repeating `'water'` alarm (`delayInMinutes` + `periodInMinutes` = `interval`) on
   `onInstalled` (which also seeds storage when empty), `onStartup`, and `storage.onChanged` for
   `interval` / `enabled` / `stopAtGoal`.
-- On `water` or `snooze`: `remind()` refreshes the tooltip, re-reads state and bails if `enabled` is off,
+- On `water` or `snooze`: `remind()` refreshes the badge, re-reads state and bails if `enabled` is off,
   `inQuiet(state)` is true, or `stopAtGoal && glasses >= goal`. Otherwise it broadcasts `DUDU_REMIND` to
-  every tab matching `^(https?|file):`, carrying one `at` stamp for the whole round.
+  every tab matching `^(https?|file):`, carrying one `at` stamp for the whole round, and then falls back to
+  `notify()` when `visiblePage()` says no page can show it.
+- **The notification has no page to roll the day over**, so `drinkFromNote()` archives the day it leaves the
+  way `popup.js` and `content.js` do, stamps `syncAt` like any other glass, and writes `bubble.open:false`
+  so a reminder left up in another tab cannot outlive the answer. `clearNote()` also runs on any `glasses`
+  change, so drinking from the popup or the bubble takes the OS copy down with it.
+- **The badge shows a dot, not a number,** while `bubble.open` is set and the day is not settled: on
+  `chrome://` pages and the new-tab page it is the only signal there is. It clears through the same path as
+  the bubble, because every dismissal writes `bubble.open:false`.
 - **Quiet hours are a fire-time check**, not a scheduling one, so a 3am alarm costs nothing and the
   cadence is untouched. The same guard covers the snooze alarm.
-- **Snooze:** a content script has no `chrome.alarms`, so the bubble's *Snooze 30s* sends
-  `DUDU_SNOOZE` and the worker arms a one-shot `snooze` alarm `SNOOZE` (30) seconds out using `when` —
-  an absolute stamp, because 30s is Chrome's granularity floor. It writes the same stamp to
+- **Snooze:** a content script has no `chrome.alarms`, so the bubble's *Snooze 10 min* sends
+  `DUDU_SNOOZE` and the worker arms a one-shot `snooze` alarm `SNOOZE` (600 s) out using `when` — an
+  absolute stamp, and deliberately the same number `snoozeUntil` carries. It writes the same stamp to
   `snoozeUntil`; the alarm clears it *before* `remind()` runs, and `schedule()` zeroes it when reminders
   are disabled, so the badge cannot outlive its snooze. Re-creating the alarm replaces the pending one.
+  `armSnooze()` is the single path for both buttons, and it closes the reminder as well as arming it: when a
+  bubble is up it writes `bubble.open:false`, so snoozing from the OS notification also drops the bubble
+  waiting in a background tab, and in lone mode the host is hidden with it. The bubble's own *Snooze* passes
+  `closeBubble:false` instead — it has already written `open:false` before sending, and a second write would
+  cut short the 180ms fade happening in the tab the user tapped.
 - **Cross-device mirror.** `syncNow(dir)` runs on a local change to a synced key, on
   `storage.sync.onChanged`, and after install/start. It reads both stores and writes only what differs:
   settings by `syncMeta`, the count by `syncCount()`, history by union, `syncMeta` by max.
@@ -230,7 +258,7 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
   and writes markup + CSS via `innerHTML`. `ensure()` runs the lazy `window.__bubuLoadAssets` first, so
   the two asset requests happen only when the widget is about to be drawn.
 - **The bubble is shared across tabs, like `pos`.** `storage.bubble = {open, at, line}`: every show
-  writes `open:true`, every dismissal (*Snooze 30s*, *I drank water!*, ×) goes through `hide()` and
+  writes `open:true`, every dismissal (*Snooze 10 min*, *I drank water!*, ×) goes through `hide()` and
   writes `open:false`. A show reuses the reminder's broadcast `at` rather than its own clock, so all
   tabs write the same record — same stamp, same caption — and none has to adopt a foreign one. Each tab
   still ignores its own echo by comparing `at`; a dismissal has no stamp and takes the local clock. It
@@ -260,11 +288,15 @@ content.js ────{type:'DUDU_ASSETS'}──> background.js (re-reads bear.
 - **`place()`** runs on every show: it reads `offsetLeft`/`offsetWidth` and nudges the bubble so both
   edges stay ≥8px inside the viewport. Measuring via `offset*` matters because the `pop` keyframe starts
   at `scale(.9)`.
-- **Copy:** the caption comes from `LINES` (ten short warm lines) through `say(stamp)`, which hashes the
-  reminder's broadcast stamp and skips the previous line read from `storage.bubble.line`. Every open
-  bubble therefore shows the same caption without a storage round-trip, and no line repeats back to
-  back. The `Water time!` heading is fixed. The snooze button carries an inline SVG clock (`.ico`,
-  `stroke:currentColor`), not an emoji. `SNOOZE` (background) is 30 s to match its label.
+- **Copy:** the caption comes from `BUBU_LINES` in `lines.js` (ten short warm lines) through `bubuLine()`,
+  which hashes the reminder's broadcast stamp and skips the previous line read from `storage.bubble.line`.
+  Every open bubble therefore shows the same caption without a storage round-trip, and no line repeats back
+  to back. The worker calls the same function with the same stamp and the same previous line *before* it
+  broadcasts — the broadcast is what overwrites `bubble.line` — so the OS notification carries the identical
+  sentence. `lines.js` is loaded twice from one file: as a content script riding with `content.js`, and via
+  `importScripts()` in the worker. The `Water time!` heading is fixed. The snooze button carries an inline SVG
+  clock (`.ico`, `stroke:currentColor`), not an emoji. `SNOOZE` (background) is 600 s — ten minutes — to match
+  its label, and the notification button derives its label from the same constant.
 - **Clock badge while snoozed:** `snoozeBadge()` toggles `.snoozing` from `snoozeUntil > Date.now()`; one
   timeout re-runs `refresh()` at expiry, cleared on every refresh so a cancelled snooze never strands it.
 - **Eyes follow the pointer** on both surfaces: offset from the bear's centre, `/40` clamped to **±14**

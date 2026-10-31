@@ -7,7 +7,8 @@ you actually drink.
 The bear is drawn from a single inline SVG, so its eyes follow your cursor, it
 blinks, it bobs, and its mood — mouth, blush, sparkle, and the hat or accessory
 it wears — is driven by how much of today's goal you have finished. Nothing is
-sent anywhere; the reminder is a page bubble, not a system notification.
+sent anywhere; the reminder is a page bubble, and a local OS notification only
+when no page is there to show it.
 
 ## What it does
 
@@ -15,10 +16,14 @@ sent anywhere; the reminder is a page bubble, not a system notification.
   shared by all tabs. The **×** on it switches Floating Bubu off everywhere.
 - **Reminders** at a chosen interval, with optional **quiet hours** (a window may
   wrap past midnight) and **stop after the goal is reached**.
-- **Snooze** postpones a single reminder by 30 seconds, shown as a small clock
+- **Snooze** postpones a single reminder by 10 minutes, shown as a small clock
   badge on the bear while it is pending.
 - **Reminders survive the bear being off.** With Floating Bubu disabled the
   reminder still appears as a lone bubble, and it is draggable there too.
+- **Reminders reach you with no page open.** A minimised Chrome window, one
+  behind another app, or one showing only `chrome://` tabs gets an OS
+  notification with *I drank water!* and *Snooze 10 min* instead of a bubble nobody
+  would see. The toolbar icon also carries a dot while a reminder is waiting.
 - **Toolbar popup** with today's count and progress bar, a seven-day strip with
   a streak, undo, the daily goal stepper, and a settings view behind the gear.
 - **Twelve bear variants** (bow, crown, bucket hat, headphones, hearts, scarf and
@@ -42,14 +47,23 @@ After changing any file, press the reload button on `chrome://extensions`; a
 reloaded extension does **not** re-inject into tabs that are already open, so
 refresh those pages as well.
 
+## Packaging
+
+`git archive -o dist.zip HEAD` builds the store upload from the committed tree.
+`.gitattributes` marks the documentation and the repository's own files as
+`export-ignore`, so the archive is the extension alone — roughly 35 KB smaller
+than a zip of the folder. Loading the archive unpacked works the same way, since
+`manifest.json` sits at its root.
+
 ## Files
 
 | File | Role |
 | --- | --- |
 | `manifest.json` | Manifest V3 declaration: permissions, content scripts, popup |
-| `background.js` | Service worker: alarms, quiet hours, snooze, badge tooltip, sync mirror |
+| `background.js` | Service worker: alarms, quiet hours, snooze, OS-notification fallback, badge dot, sync mirror |
 | `content.js` | The widget: closed shadow root, bubbles, drag, per-page state |
 | `preload.js` | `document_start` helper that publishes the lazy asset loader |
+| `lines.js` | The reminder sentences and `bubuLine()`, shared by the page bubble and the OS notification |
 | `bear.css` | Rules and keyframes for the bear and its variants |
 | `bear.svg` | One drawing, many looks — variants are extra groups switched by `data-bear` |
 | `popup.html`, `popup.js`, `style.css` | Toolbar popup: tracker view, week strip, settings |
@@ -69,7 +83,8 @@ mirrored into `chrome.storage.sync`, which is Chrome's own sync supplied by the
 browser — the data goes to the signed-in Chrome profile, not to a third party.
 
 Permissions requested are `alarms` (the reminder timer), `storage` (state and
-sync) and `tabs` (broadcasting a reminder to open pages).
+sync), `tabs` (finding a page that can show a reminder) and `notifications` (the
+OS fallback when no page can).
 
 ## Licence
 

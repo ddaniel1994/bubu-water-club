@@ -9,7 +9,14 @@ const HISTORY=30,num=v=>Number.isFinite(Number(v))?Number(v):0,serial=d=>d.toLoc
 // history. The popup and the content script both roll over (either may be the first to see a new day)
 // and each keys its record by `day`, so rolling over twice replaces rather than duplicates it.
 async function rollover(){if(state.lastDay===today())return;const done={day:state.lastDay,glasses:num(state.glasses),goal:num(state.goal)||1},hist=[...(state.history||[]).filter(d=>d&&d.day&&d.day!==done.day),...(state.lastDay?[done]:[])].sort((a,b)=>a.day<b.day?-1:1).slice(-HISTORY);state.history=hist;state.glasses=0;state.lastDay=today();state.syncAt=Date.now();await chrome.storage.local.set({glasses:0,lastDay:state.lastDay,syncAt:state.syncAt,history:hist}).catch(()=>{});}
-async function init(){const svg=await fetch('bear.svg').then(r=>r.text()).catch(()=>'');if(svg)$('bear').insertAdjacentHTML('beforeend',svg);state=await chrome.storage.local.get(DEFAULTS).catch(()=>({...DEFAULTS}));await rollover();fillHours();render();}
+// `2 minutes` was dropped from the picker, so a device still storing it would show a blank select while the
+// reminders kept firing on the old cadence. The first remaining choice takes over, stamped like any other edit so
+// the account keeps the newer value rather than the newer arrival.
+async function fitInterval(){const opts=[...$('interval').options].map(o=>Number(o.value));
+  if(!opts.length||opts.includes(num(state.interval)))return;
+  state.interval=opts[0];state.syncMeta={...(state.syncMeta||{}),interval:Date.now()};
+  await chrome.storage.local.set({interval:state.interval,syncMeta:state.syncMeta}).catch(()=>{});}
+async function init(){const svg=await fetch('bear.svg').then(r=>r.text()).catch(()=>'');if(svg)$('bear').insertAdjacentHTML('beforeend',svg);state=await chrome.storage.local.get(DEFAULTS).catch(()=>({...DEFAULTS}));await rollover();await fitInterval();fillHours();render();}
 // The live numbers — count, bar, goal, stepper buttons and message. Split out of render() so a held
 // stepper can repaint on every tick without re-querying the alarm or restarting the confetti.
 function paint(){const pct=Math.min(100,100*state.glasses/Math.max(1,state.goal)),done=state.glasses>=state.goal;$('count').textContent=`${state.glasses} / ${state.goal}${done?' ✓':''}`;$('progress').style.width=`${pct}%`;$('goal').textContent=state.goal;$('goalDown').disabled=state.goal<=1;$('goalUp').disabled=state.goal>=30;$('message').textContent=done?'Amazing Bubu! Dudu is proud of you!':'Dudu is cheering for you!';$('undo').disabled=state.glasses<=0;document.body.classList.toggle('done',done);return done;}

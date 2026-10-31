@@ -1,0 +1,7 @@
+# A packaged build should be the extension and nothing else. `git archive -o dist.zip HEAD` honours these
+# lines, so the zip that goes to the store carries no repository paperwork. A plain `zip -r` or Chrome's
+# "Pack extension" ignores this file, in which case exclude the same four paths by hand.
+/ARCHITECTURE.md  export-ignore
+/README.md        export-ignore
+/.gitignore       export-ignore
+/.gitattributes   export-ignore
